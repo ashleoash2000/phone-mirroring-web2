@@ -2,10 +2,14 @@ const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
 const crypto = require("crypto");
+const path = require("path");
 
 const app = express();
 app.disable("x-powered-by");
-app.use(express.static("public", { extensions: ["html"] }));
+app.use(express.static(path.join(__dirname, "public"), { extensions: ["html"] }));
+app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "index.html"));
+});
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true, maxPayload: 64 * 1024 });
