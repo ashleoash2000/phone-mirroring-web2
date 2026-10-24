@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Private Screen Share</title>
+<style>
+:root{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#18212f;background:#f3f6fa}
+*{box-sizing:border-box}body{margin:0;padding:20px;display:flex;justify-content:center}
+main{width:min(720px,100%);background:white;border:1px solid #dce3ec;border-radius:18px;padding:22px;box-shadow:0 8px 30px #15253b12}
+h1{font-size:1.45rem;margin:0 0 8px}p{line-height:1.5;color:#475569}.notice{background:#fff7df;border:1px solid #f0d68a;padding:12px;border-radius:10px;color:#654d0b}
+.tabs{display:flex;gap:8px;margin:18px 0}.tabs button{flex:1}.tabs button.active{background:#173b68;color:white}
+button,input{font:inherit;border-radius:10px;padding:12px;border:1px solid #cbd5e1;width:100%}button{cursor:pointer;background:#edf2f7;color:#172033;font-weight:650}button:disabled{opacity:.5;cursor:not-allowed}
+.panel{display:none}.panel.active{display:block}.stack{display:grid;gap:12px}.code{font-size:1.35rem;letter-spacing:.18em;font-weight:800;text-align:center;padding:12px;background:#eef4ff;border-radius:10px;overflow-wrap:anywhere}
+.status{margin-top:14px;padding:10px;border-radius:10px;background:#eef2f7;color:#334155;min-height:44px}.status.error{background:#fff0f0;color:#9f1239}
+video{width:100%;background:#0b1220;border-radius:12px;min-height:220px;max-height:70vh;margin-top:12px}
+small{color:#64748b}.row{display:flex;gap:10px}.row>*{flex:1}
+</style>
+</head>
+<body><main>
+<h1>Private Screen Share</h1>
+<p>Share one phone's screen to another browser using a temporary pairing code and an encrypted WebRTC connection.</p>
+<div class="notice"><strong>Consent and privacy:</strong> Screen sharing starts only after the sender presses Start and approves Android's browser prompt. Stop sharing any time. Do not share banking apps, passwords, or sensitive notifications.</div>
+<div class="tabs">
+<button id="senderTab" class="active" type="button">Share this screen</button>
+<button id="viewerTab" type="button">View a screen</button>
+</div>
+<section id="senderPanel" class="panel active">
+<div class="stack">
+<p>1. Generate a one-time code. Give it only to the person you want to watch.</p>
+<button id="generateBtn" type="button">Generate pairing code</button>
+<div id="pairCode" class="code" aria-live="polite">--------</div>
+<p>2. Tap Start sharing and choose the screen or app Android allows you to share.</p>
+<button id="startBtn" type="button" disabled>Start sharing</button>
+<button id="stopBtn" type="button" disabled>Stop sharing</button>
+<small>Keep this page open while sharing. A browser may not support screen capture on every Android device.</small>
+</div>
+</section>
+<section id="viewerPanel" class="panel">
+<div class="stack">
+<label for="codeInput">Enter the sender's 8-character code</label>
+<input id="codeInput" maxlength="8" autocomplete="off" autocapitalize="characters" placeholder="e.g. K7M4P9TX">
+<button id="connectBtn" type="button">Connect and view</button>
+<button id="disconnectBtn" type="button" disabled>Disconnect</button>
+<video id="remoteVideo" autoplay playsinline controls></video>
+<small>Video is streamed peer-to-peer when network conditions allow. A TURN relay may be needed on some networks.</small>
+</div>
+</section>
+<div id="status" class="status" role="status">Ready. Choose a role to begin.</div>
+<p><small>Security note: deploy this site on HTTPS. WebSocket signaling should use WSS. The signaling server forwards connection setup only; it does not receive the screen video.</small></p>
+</main>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const status = $("status");
+  const senderTab = $("senderTab"), viewerTab = $("viewerTab");
+  const senderPanel = $("senderPanel"), viewerPanel = $("viewerPanel");
+  const pairCode = $("pairCode"), codeInput = $("codeInput");
+  const startBtn = $("startBtn"), stopBtn = $("stopBtn"), generateBtn = $("generateBtn");
+  const connectBtn = $("connectBtn"), disconnectBtn = $("disconnectBtn"), remoteVideo = $("remoteVideo");
+  let ws = null, pc = null, localStream = null, role = null, code = null;
+  let pendingIce = [];
+
+  function setStatus(message, error=false) {
+    status.textContent = message;
+    status.className = "status" + (error ? " error" : "");
+  }
+  function showRole(which) {
+    senderPanel.classList.toggle("active", which === "sender");
+    viewerPanel.classList.toggle("active", which === "viewer");
+    senderTab.classList.toggle("active", which === "sender");
+    viewerTab.classList.toggle("active", which === "viewer");
+  }
+  senderTab.onclick = () => showRole("sender");
+  viewerTab.onclick = () => showRole("viewer");
+
+  function randomCode() {
+    const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    const bytes = new Uint8Array(8);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, b => chars[b % chars.length]).join("");
+  }
+  function signalUrl() {
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    return `${proto}//${location.host}/signal`;
+  }
+  function send(type, data) {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({type, data}));
+  }
+  function cleanConnection() {
+    if (pc) { pc.onicecandidate = null; pc.ontrack = null; pc.close(); pc = null; }
+    pendingIce = [];
+  }
+  function closeSocket() {
+    if (ws) { ws.onclose = null; ws.close(); ws = null; }
+  }
+  function stopAll(message="Sharing stopped.") {
+    cleanConnection();
+    closeSocket();
+    if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+    remoteVideo.srcObject = null;
+    startBtn.disabled = !code;
+    stopBtn.disabled = true;
+    connectBtn.disabled = false;
+    disconnectBtn.disabled = true;
+    role = null;
+    setStatus(message);
+  }
+  function makePeer() {
+    cleanConnection();
+    pc = new RTCPeerConnection({
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+    });
+    pc.onicecandidate = e => { if (e.candidate) send("ice", e.candidate); };
+    pc.onconnectionstatechange = () => {
+      if (pc && ["connected","failed","disconnected"].includes(pc.connectionState)) {
+        setStatus("WebRTC connection: " + pc.connectionState + (pc.connectionState === "failed" ? ". A TURN relay may be required." : ""));
+      }
+    };
+    pc.ontrack = e => {
+      remoteVideo.srcObject = e.streams[0];
+      remoteVideo.play().catch(() => {});
+      setStatus("Connected. Live screen is being received.");
+    };
+  }
+  function connectSocket(joinRole, joinCode) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      ws = new WebSocket(signalUrl());
+      ws.onopen = () => ws.send(JSON.stringify({type:"join", role:joinRole, code:joinCode}));
+      ws.onmessage = async event => {
+        let msg;
+        try { msg = JSON.parse(event.data); } catch { return; }
+        if (msg.type === "error") {
+          setStatus(msg.message || "Connection error.", true);
+          if (!settled) { settled = true; reject(new Error(msg.message || "Connection error")); }
+          return;
+        }
+        if (msg.type === "joined") {
+          if (!settled) { settled = true; resolve(); }
+          setStatus("Paired as " + joinRole + ". Waiting for the other phone…");
+        } else if (msg.type === "peer-ready") {
+          if (role === "sender" && pc) {
+            try {
+              const offer = await pc.createOffer();
+              await pc.setLocalDescription(offer);
+              send("offer", pc.localDescription);
+              setStatus("Offer sent. Connecting viewer…");
+            } catch (e) { setStatus("Could not start connection: " + e.message, true); }
+          }
+        } else if (msg.type === "offer" && role === "viewer" && pc) {
+          try {
+            await pc.setRemoteDescription(msg.data);
+            for (const c of pendingIce) await pc.addIceCandidate(c);
+            pendingIce = [];
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            send("answer", pc.localDescription);
+            setStatus("Connecting to sender…");
+          } catch (e) { setStatus("Offer failed: " + e.message, true); }
+        } else if (msg.type === "answer" && role === "sender" && pc) {
+          try {
+            await pc.setRemoteDescription(msg.data);
+            for (const c of pendingIce) await pc.addIceCandidate(c);
+            pendingIce = [];
+            setStatus("Viewer accepted. Establishing live stream…");
+          } catch (e) { setStatus("Answer failed: " + e.message, true); }
+        } else if (msg.type === "ice" && pc && msg.data) {
+          try {
+            if (pc.remoteDescription) await pc.addIceCandidate(msg.data);
+            else pendingIce.push(msg.data);
+          } catch {}
+        } else if (msg.type === "peer-left") {
+          setStatus("The other phone disconnected.");
+        }
+      };
+      ws.onerror = () => {
+        setStatus("Could not connect to the signaling server. Check HTTPS hosting and server status.", true);
+        if (!settled) { settled = true; reject(new Error("WebSocket connection failed")); }
+      };
+      ws.onclose = () => {
+        if (role) setStatus("Signaling connection closed.");
+      };
+    });
+  }
+
+  generateBtn.onclick = () => {
+    if (role) stopAll();
+    code = randomCode();
+    pairCode.textContent = code;
+    startBtn.disabled = false;
+    setStatus("Pairing code generated. Share it privately; it expires when you stop sharing or the server's room expires.");
+  };
+
+  startBtn.onclick = async () => {
+    if (!code) return;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+      setStatus("This browser does not provide screen capture here. Try an up-to-date desktop browser, or use a native Android app for Android screen capture.", true);
+      return;
+    }
+    try {
+      role = "sender";
+      startBtn.disabled = true;
+      setStatus("Requesting screen-capture permission…");
+      localStream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 15 }, audio: false });
+      localStream.getVideoTracks()[0].addEventListener("ended", () => stopAll("Screen sharing ended."));
+      makePeer();
+      localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+      await connectSocket("sender", code);
+      stopBtn.disabled = false;
+      setStatus("Screen capture approved. Waiting for viewer to connect…");
+    } catch (e) {
+      stopAll(e.name === "NotAllowedError" ? "Screen sharing was cancelled or denied." : "Could not start sharing: " + e.message);
+    }
+  };
+
+  stopBtn.onclick = () => stopAll();
+  connectBtn.onclick = async () => {
+    const entered = codeInput.value.trim().toUpperCase();
+    if (!/^[A-HJ-NP-Z2-9]{8}$/.test(entered)) {
+      setStatus("Enter the complete 8-character pairing code.", true); return;
+    }
+    try {
+      role = "viewer";
+      connectBtn.disabled = true;
+      makePeer();
+      await connectSocket("viewer", entered);
+      disconnectBtn.disabled = false;
+      setStatus("Joined. Waiting for the sender's stream…");
+    } catch {
+      cleanConnection(); closeSocket(); role = null;
+      connectBtn.disabled = false;
+    }
+  };
+  disconnectBtn.onclick = () => stopAll("Disconnected from sender.");
+  window.addEventListener("beforeunload", () => {
+    if (localStream) localStream.getTracks().forEach(t => t.stop());
+    if (pc) pc.close();
+    if (ws) ws.close();
+  });
+})();
+</script>
+</body>
+</html>
